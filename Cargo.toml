@@ -1,0 +1,28 @@
+[package]
+name = "fdon-rs"
+version = "0.1.0"
+edition = "2021"
+
+# --- REQUIRED FIELDS FOR PUBLISHING ---
+
+description = "A high-performance, zero-copy, and minified data format (FDON) parser for Rust, leveraging SIMD for read speed."
+license = "AGPL-3.0-or-later" 
+authors = ["Teaserverse <contact@teaserverse.online>"] 
+readme = "README.md"
+repository = "https://github.com/TeaserLang/fdon-rs" 
+keywords = ["fdon", "parser", "zero-copy", "serialization", "high-performance"]
+categories = ["data-structures", "parsing", "encoding"]
+
+# --- EXCLUDE FILES FOR CRATE PACKAGING (Tối ưu kích thước) ---
+exclude = [
+    "main.rs",
+    "tests/*",
+    "*.fdon" # Ví dụ file FDON
+]
+
+# --- DEPENDENCIES ---
+[dependencies]
+memchr = "2.7.6"
+# Dependencies cho tính năng serialize và JSON output
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
