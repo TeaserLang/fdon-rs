@@ -1,6 +1,16 @@
 use serde::Serialize;
-use std::collections::HashMap;
 use memchr::{memchr, memchr3};
+
+// --- TỐI ƯU HÓA "ALL-IN" ---
+use bumpalo::{
+    Bump, 
+    collections::Vec as BumpVec // 1. Dùng Vec của Bumpalo (Arena)
+};
+// 2. Dùng HashMap của HASHBROWN (Không phải std)
+use hashbrown::HashMap as BumpHashMap;
+// 3. Dùng Hasher của AHASH
+use ahash::RandomState as AHasher;
+// --- KẾT THÚC KẾ HOẠCH ---
 
 // --- Cấu trúc dữ liệu ---
 
@@ -13,26 +23,28 @@ pub enum FdonNumber {
 }
 
 /// Represents any FDON value (Zero-Copy)
+/// CHÚ Ý: 'bump (lifetime) giờ đây là một phần của kiểu Allocator
 #[derive(Debug, Serialize, PartialEq)]
 #[serde(untagged)]
-pub enum FdonValue<'a> {
+pub enum FdonValue<'a, 'bump> {
     Null,
     Bool(bool),
     Number(FdonNumber),
     String(&'a str),
-    Array(Vec<FdonValue<'a>>),
-    Object(HashMap<&'a str, FdonValue<'a>>),
+    // Tối ưu hóa Array (Thành công từ Kế hoạch Hybrid)
+    Array(BumpVec<'bump, FdonValue<'a, 'bump>>),
+    // Tối ưu hóa Object (Kế hoạch "All-In")
+    // Kiểu đầy đủ: HashMap<Key, Value, Hasher, Allocator>
+    Object(BumpHashMap<&'a str, FdonValue<'a, 'bump>, AHasher, &'bump Bump>),
 }
 
 /// Parse Error type
 pub type FdonParseError = (String, usize);
-pub type ParseResult<'a, T> = Result<T, FdonParseError>;
+pub type ParseResult<'a, 'bump, T> = Result<T, FdonParseError>;
 
-// --- Minify Function (Đã tối ưu hóa bằng cách xử lý byte) ---
+// --- Minify Function (Giữ nguyên) ---
 
-/// Minifies an FDON string, removing all whitespace outside of strings.
-/// Tối ưu hóa bằng cách xử lý byte thay vì ký tự (char) để tăng tốc độ.
-#[inline(always)] // Cưỡng chế inline vì nó được gọi trong hàm static
+#[inline(always)]
 pub fn minify_fdon(input: &str) -> String {
     let input_bytes = input.as_bytes();
     let mut minified = Vec::with_capacity(input.len());
@@ -44,40 +56,37 @@ pub fn minify_fdon(input: &str) -> String {
                 in_string = !in_string;
                 minified.push(byte);
             }
-            // Skip these bytes (whitespace) ONLY if not in a string
             b' ' | b'\n' | b'\r' | b'\t' if !in_string => {
                 // Skip
             }
-            // Keep all other characters/bytes
             _ => {
                 minified.push(byte);
             }
         }
     }
-    // Tối ưu hóa bằng unsafe (an toàn vì input là &str hợp lệ)
     unsafe { String::from_utf8_unchecked(minified) }
 }
 
 
 // --- Parser ---
 
-/// The FDON Parser, borrows the minified input data.
-pub struct FdonParser<'a> {
+pub struct FdonParser<'a, 'bump> {
     data: &'a [u8],
     index: usize,
+    arena: &'bump Bump, 
 }
 
-impl<'a> FdonParser<'a> {
-    /// Creates a new parser from a *minified* string slice.
+impl<'a, 'bump> FdonParser<'a, 'bump> {
     #[inline(always)]
-    pub fn new(input: &'a str) -> Self {
+    pub fn new(input: &'a str, arena: &'bump Bump) -> Self {
         FdonParser {
             data: input.as_bytes(),
             index: 0,
+            arena,
         }
     }
 
-    // --- Helper functions ---
+    // --- Helpers (Không đổi) ---
     #[inline(always)]
     fn peek(&self) -> Option<u8> {
         self.data.get(self.index).copied()
@@ -88,9 +97,8 @@ impl<'a> FdonParser<'a> {
         self.index += 1;
     }
 
-    /// Consumes an expected byte, or returns an error.
     #[inline(always)]
-    fn consume(&mut self, char: u8) -> ParseResult<'a, ()> {
+    fn consume(&mut self, char: u8) -> ParseResult<'a, 'bump, ()> {
         if self.peek() == Some(char) {
             self.advance();
             Ok(())
@@ -103,11 +111,10 @@ impl<'a> FdonParser<'a> {
         }
     }
 
-    /// Starts the parsing process (Main function)
+    // --- Parse Logic (Không đổi) ---
     #[inline(always)]
-    pub fn parse(&mut self) -> ParseResult<'a, FdonValue<'a>> {
+    pub fn parse(&mut self) -> ParseResult<'a, 'bump, FdonValue<'a, 'bump>> {
         let value = self.parse_value()?;
-        // Ensure we consumed the entire file
         if self.index != self.data.len() {
             Err((
                 "Extra data detected at end of file".to_string(),
@@ -118,11 +125,10 @@ impl<'a> FdonParser<'a> {
         }
     }
 
-    /// Parses a single FDON value
     #[inline(always)]
-    fn parse_value(&mut self) -> ParseResult<'a, FdonValue<'a>> {
+    fn parse_value(&mut self) -> ParseResult<'a, 'bump, FdonValue<'a, 'bump>> {
         let type_char = self.peek().ok_or(("Unexpected EOF".to_string(), self.index))?;
-        self.advance(); // Consume the type character
+        self.advance(); 
 
         match type_char {
             b'O' => self.parse_object(),
@@ -138,9 +144,13 @@ impl<'a> FdonParser<'a> {
         }
     }
 
-    /// Parses an Object: O{key:value,...}
-    fn parse_object(&mut self) -> ParseResult<'a, FdonValue<'a>> {
-        let mut obj = HashMap::new();
+    // --- Parse Object (TỐI ƯU HÓA "ALL-IN") ---
+    fn parse_object(&mut self) -> ParseResult<'a, 'bump, FdonValue<'a, 'bump>> {
+        // 1. Lấy AHasher
+        let hasher = AHasher::new();
+        // 2. Tạo HashMap BÊN TRONG ARENA (self.arena) VỚI AHasher
+        let mut obj = BumpHashMap::with_hasher_in(hasher, self.arena);
+        
         self.consume(b'{')?;
 
         while self.peek() != Some(b'}') {
@@ -162,9 +172,9 @@ impl<'a> FdonParser<'a> {
         Ok(FdonValue::Object(obj))
     }
 
-    /// Parses a Key (reads until ':')
+    // --- Parse Key (Không đổi) ---
     #[inline(always)]
-    fn parse_key(&mut self) -> ParseResult<'a, &'a str> {
+    fn parse_key(&mut self) -> ParseResult<'a, 'bump, &'a str> {
         let start = self.index;
         let remaining_data = &self.data[self.index..];
 
@@ -172,9 +182,8 @@ impl<'a> FdonParser<'a> {
             Some(pos) => {
                 let end = self.index + pos;
                 let key_slice = &self.data[start..end];
-                self.index = end; // Stop *at* the ':'
+                self.index = end; 
 
-                // TỐI ƯU HÓA UNSAFE: Bỏ qua xác thực UTF-8 vì FDON key phải là UTF-8
                 unsafe {
                     Ok(std::str::from_utf8_unchecked(key_slice))
                 }
@@ -183,9 +192,10 @@ impl<'a> FdonParser<'a> {
         }
     }
 
-    /// Parses an Array: A[value,...]
-    fn parse_array(&mut self) -> ParseResult<'a, FdonValue<'a>> {
-        let mut arr = Vec::new();
+    // --- Parse Array (Đã tối ưu với BumpVec) ---
+    fn parse_array(&mut self) -> ParseResult<'a, 'bump, FdonValue<'a, 'bump>> {
+        let mut arr = BumpVec::new_in(self.arena);
+        
         self.consume(b'[')?;
 
         while self.peek() != Some(b']') {
@@ -204,9 +214,9 @@ impl<'a> FdonParser<'a> {
         Ok(FdonValue::Array(arr))
     }
 
-    /// Parses a String: S"..."
+    // --- Parse String (Không đổi) ---
     #[inline(always)]
-    fn parse_string(&mut self) -> ParseResult<'a, FdonValue<'a>> {
+    fn parse_string(&mut self) -> ParseResult<'a, 'bump, FdonValue<'a, 'bump>> {
         self.consume(b'"')?;
         let start = self.index;
         let remaining_data = &self.data[self.index..];
@@ -216,15 +226,8 @@ impl<'a> FdonParser<'a> {
                 let end = self.index + pos;
                 let val_slice = &self.data[start..end];
                 
-                // FDON rule: no escapes, no quotes inside.
-                // (memchr nhanh hơn .contains)
-                if memchr(b'"', val_slice).is_some() {
-                     return Err(("Invalid quote (\") found inside string".to_string(), start));
-                }
+                self.index = end + 1; 
 
-                self.index = end + 1; // Move *after* the closing "
-
-                // TỐI ƯU HÓA UNSAFE: Bỏ qua xác thực UTF-8
                 let val_str = unsafe { std::str::from_utf8_unchecked(val_slice) };
                 
                 Ok(FdonValue::String(val_str))
@@ -233,20 +236,20 @@ impl<'a> FdonParser<'a> {
         }
     }
 
-    /// Parses a Number: N123 or N123.45
+    // --- Parse Number (SỬA LỖI TYPO!!!) ---
     #[inline(always)]
-    fn parse_number(&mut self) -> ParseResult<'a, FdonValue<'a>> {
+    fn parse_number(&mut self) -> ParseResult<'a, 'bump, FdonValue<'a, 'bump>> {
         let start = self.index;
         let remaining_data = &self.data[self.index..];
 
         let end;
+        // SỬA LỖI: remaining_muta -> remaining_data
         match memchr3(b',', b'}', b']', remaining_data) {
             Some(pos) => {
                 end = self.index + pos;
-                self.index = end; // Stop *at* the delimiter
+                self.index = end; 
             }
             None => {
-                // Number runs to the end of the file
                 end = self.data.len();
                 self.index = end;
             }
@@ -257,26 +260,22 @@ impl<'a> FdonParser<'a> {
             return Err(("Empty number value".to_string(), self.index));
         }
         
-        // --- TỐI ƯU HÓA: Kiểm tra số thực bằng byte SIMD-optimized ---
         let is_float = memchr(b'.', num_slice).is_some();
-        
-        // TỐI ƯU HÓA UNSAFE: Bỏ qua xác thực UTF-8 (vì số phải là UTF-8)
-        let num_str = unsafe { std::str::from_utf8_unchecked(num_slice) };
 
         if is_float {
-            let val: f64 = num_str.parse()
+            let val: f64 = fast_float::parse(num_slice)
                 .map_err(|e| (format!("Invalid float format: {}", e), start))?;
             Ok(FdonValue::Number(FdonNumber::Float(val)))
         } else {
-            let val: i64 = num_str.parse()
-                .map_err(|e| (format!("Invalid integer format: {}", e), start))?;
+            let val: i64 = atoi::atoi(num_slice)
+                .ok_or(("Invalid integer format or out of range".to_string(), start))?;
             Ok(FdonValue::Number(FdonNumber::Integer(val)))
         }
     }
 
-    /// Parses a Boolean: Btrue or Bfalse
+    // --- Parse Boolean (Không đổi) ---
     #[inline(always)]
-    fn parse_boolean(&mut self) -> ParseResult<'a, FdonValue<'a>> {
+    fn parse_boolean(&mut self) -> ParseResult<'a, 'bump, FdonValue<'a, 'bump>> {
         if self.data.get(self.index..self.index + 4) == Some(b"true") {
             self.index += 4;
             Ok(FdonValue::Bool(true))
@@ -290,58 +289,13 @@ impl<'a> FdonParser<'a> {
 }
 
 
-// --- Public API Functions ---
+// --- Public API Functions (Chỉ dùng Arena) ---
 
-// --- LỰA CHỌN 1: AN TOÀN (MẶC ĐỊNH) ---
-/// (Recommended) Parses a minified FDON string using the zero-copy method.
-///
-/// The returned `FdonValue` borrows its string and key slices directly from the
-/// input `minified_data`. Therefore, `minified_data` must outlive the returned value.
-///
-/// # Example
-/// ```rust
-/// // (Giả sử fdon_rs đã được import)
-/// // let raw_data = "O{key:S\"value\"}";
-/// // let minified_data = fdon_rs::minify_fdon(raw_data);
-/// // match fdon_rs::parse_fdon_zero_copy_ref(&minified_data) {
-/// //     Ok(value) => { /* ... */ },
-/// //     Err(e) => { /* ... */ }
-/// // }
-/// ```
-#[inline] // Inline hàm wrapper này
-pub fn parse_fdon_zero_copy_ref<'a>(minified_data: &'a str) -> ParseResult<'a, FdonValue<'a>> {
-    let mut parser = FdonParser::new(minified_data);
-    parser.parse()
-}
-
-// --- LỰA CHỌN 2: TỐC ĐỘ TỐI ĐA (BENCHMARK/CLI) ---
-/// (Benchmark/CLI Use) Minifies and parses FDON data, returning a `'static` value.
-///
-/// This function is extremely fast and convenient for short-lived processes (like CLIs or tests)
-/// as it bypasses lifetime management by leaking the minified `String`.
-///
-/// **WARNING:** This function **WILL LEAK MEMORY** (one `String`) every time it is called.
-/// Do NOT use this in a long-running server or application where memory leaks are critical.
-///
-/// # Example
-/// ```rust
-/// // (Giả sử fdon_rs đã được import)
-/// // let raw_data = "O{key:S\"value\"}";
-/// // match fdon_rs::parse_fdon_zero_copy_static(raw_data) {
-/// //     Ok(static_value) => { /* ... */ },
-/// //     Err(e) => { /* ... */ }
-/// // }
-/// ```
-pub fn parse_fdon_zero_copy_static(input: &str) -> ParseResult<'static, FdonValue<'static>> {
-    // 1. Minify (creates a new owned String, đã tối ưu hóa)
-    let minified = minify_fdon(input);
-
-    // 2. Leak the minified string to satisfy the 'static lifetime.
-    let leaked_data: &'static str = Box::leak(minified.into_boxed_str());
-    
-    // 3. Parse (Zero-Copy)
-    let mut parser = FdonParser::new(leaked_data);
-    
-    // Safety: Transmute không cần thiết nếu parser.parse() trả về đúng lifetime
+#[inline]
+pub fn parse_fdon_zero_copy_arena<'a, 'bump>(
+    minified_data: &'a str,
+    arena: &'bump Bump
+) -> ParseResult<'a, 'bump, FdonValue<'a, 'bump>> {
+    let mut parser = FdonParser::new(minified_data, arena);
     parser.parse()
 }

@@ -3,24 +3,32 @@ use std::fs;
 use std::process;
 use std::time::Instant;
 
-// Import crate (sử dụng tên từ Cargo.toml)
-// Chúng ta sẽ import các hàm/struct công khai từ src/lib.rs
-// (Sử dụng cả hai hàm API công khai)
-use fdon_rs::{minify_fdon, FdonParseError, FdonValue, parse_fdon_zero_copy_static};
+// --- SỬA LỖI API ---
+// Import API mới (chỉ dùng Arena) và các struct liên quan
+use fdon_rs::{minify_fdon, FdonParseError, FdonValue, parse_fdon_zero_copy_arena};
+// Import Bumpalo
+use bumpalo::Bump;
+// --- KẾT THÚC SỬA LỖI ---
 
-// Hàm trợ giúp in lỗi
-fn print_error((msg, pos): FdonParseError, minified_content: &str) -> ! {
+
+// Hàm trợ giúp in lỗi (Giờ sẽ in lỗi trên file thô)
+fn print_error((msg, pos): FdonParseError, raw_content: &str) -> ! {
     eprintln!("FDON Syntax Error: {} at position {}", msg, pos);
     
     // Chỉ in một phần của nội dung nếu nó quá dài
     const MAX_LEN: usize = 100;
-    if minified_content.len() > MAX_LEN {
+    if raw_content.len() > MAX_LEN {
          let start = if pos > MAX_LEN / 2 { pos - MAX_LEN / 2 } else { 0 };
-         let end = std::cmp::min(minified_content.len(), start + MAX_LEN);
-         eprintln!("...{}...", &minified_content[start..end]);
-         eprintln!("{}^", " ".repeat(pos - start));
+         let end = std::cmp::min(raw_content.len(), start + MAX_LEN);
+         eprintln!("...{}...", &raw_content[start..end]);
+         // Tính toán vị trí ^
+         if pos >= start {
+            eprintln!("{}^", " ".repeat(pos - start));
+         } else {
+            eprintln!("^ (Error at start)");
+         }
     } else {
-        eprintln!("{}", minified_content);
+        eprintln!("{}", raw_content);
         eprintln!("{}^", " ".repeat(pos));
     }
     
@@ -47,29 +55,30 @@ fn main() {
 
     // --- Bước 1: Minify (Đo thời gian riêng) ---
     let start_time_minify = Instant::now();
-    // Chúng ta chạy minify riêng để lấy kích thước và thời gian, 
-    // nhưng hàm `parse_fdon_zero_copy_static` sẽ chạy lại nó.
-    // (Trong benchmark thực tế, chúng ta sẽ chỉ gọi hàm static)
-    let minified_content_for_stats = minify_fdon(&content);
+    let minified_content = minify_fdon(&content);
     let duration_minify = start_time_minify.elapsed();
     
     println!("--- FDON Process Timing ---");
-    println!("Minified Data Size: {} bytes", minified_content_for_stats.len());
+    println!("Minified Data Size: {} bytes", minified_content.len());
     println!("Minify Time: {:.6} ms", duration_minify.as_secs_f64() * 1000.0);
     println!("{}", "-".repeat(30));
 
 
-    // --- Bước 2: Parse (Sử dụng hàm static TỐC ĐỘ CAO) ---
-    // Hàm này tự động minify VÀ parse, chấp nhận rò rỉ RAM
+    // --- Bước 2: Parse (Sử dụng Arena) ---
+    
+    // TẠO ARENA
+    let arena = Bump::new();
+    
     let start_time_parse = Instant::now();
     
-    let value: FdonValue<'static> = match parse_fdon_zero_copy_static(&content) {
+    // 'value' giờ đây mượn 'minified_content' (cho 'a) VÀ 'arena' (cho 'bump)
+    let value: FdonValue<'_, '_> = match parse_fdon_zero_copy_arena(&minified_content, &arena) {
         Ok(v) => v,
-        // Nếu lỗi, chúng ta cần minified_content để in lỗi
-        Err(e) => print_error(e, &minified_content_for_stats),
+        // In lỗi trên nội dung ĐÃ MINIFY (vì index lỗi là trên file đó)
+        Err(e) => print_error(e, &minified_content),
     };
 
-    let duration_parse = start_time_parse.elapsed(); // Thời gian này bao gồm cả Minify + Parse
+    let duration_parse = start_time_parse.elapsed(); 
 
     // --- Serialization và In kết quả ---
     let start_time_serialize = Instant::now();
@@ -91,9 +100,11 @@ fn main() {
     let duration_serialize_ms = duration_serialize.as_secs_f64() * 1000.0;
     
     println!("--- FDON Process Timing (Summary) ---");
-    // (Lưu ý: Thời gian Parse này bao gồm cả Minify)
-    println!("🚀 Parse Time (Minify + Parse, Zero-Copy Static): {:.6} ms", duration_parse_ms);
+    // (Lưu ý: Thời gian Parse này KHÔNG bao gồm Minify)
+    println!("🚀 Parse Time (Arena, Zero-Copy): {:.6} ms", duration_parse_ms);
     println!("⚡ Serialize Time (minified): {:.6} ms", duration_serialize_ms);
     println!("Total Time (Parse + Serialize): {:.6} ms", duration_parse_ms + duration_serialize_ms);
     println!("{}", "-".repeat(30));
+
+    // Arena sẽ tự động được giải phóng khi 'arena' ra khỏi scope
 }

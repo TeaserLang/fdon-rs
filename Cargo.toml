@@ -1,6 +1,6 @@
 [package]
 name = "fdon-rs"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 # --- REQUIRED FIELDS FOR PUBLISHING ---
@@ -23,6 +23,22 @@ exclude = [
 # --- DEPENDENCIES ---
 [dependencies]
 memchr = "2.7.6"
-# Dependencies cho tính năng serialize và JSON output
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+
+# --- TỐI ƯU HÓA PARSE SỐ (Giữ nguyên) ---
+fast-float = "0.2.0"
+atoi = "2.0.0"
+
+# --- TỐI ƯU HÓA "ALL-IN" (Kế hoạch cuối cùng) ---
+
+# 1. Bumpalo (Arena + Vec)
+# Thêm 'allocator-api2' để nó có thể "nói chuyện" với hashbrown
+bumpalo = { version = "3.16.0", features = ["collections", "serde", "allocator-api2"] }
+
+# 2. Hashbrown (HashMap nhanh)
+# Thêm 'allocator-api2' để nó nhận diện Bumpalo
+hashbrown = { version = "0.14.5", features = ["serde", "allocator-api2"] }
+
+# 3. AHash (Hasher nhanh)
+ahash = { version = "0.8.11", features = ["serde"] }
