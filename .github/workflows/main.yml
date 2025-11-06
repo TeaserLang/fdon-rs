@@ -1,0 +1,60 @@
+name: Publish Crate
+
+on:
+  # Kích hoạt workflow khi tạo một tag mới (ví dụ: v1.0.0, v2.5.3)
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+*'
+
+jobs:
+  publish:
+    # Đảm bảo job chỉ chạy khi tag được push (không phải từ Pull Request)
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+
+    # Bắt buộc cho Trusted Publishing (OIDC)
+    permissions:
+      id-token: write # Cần thiết để lấy token OIDC từ GitHub
+      contents: read  # Cần thiết để checkout mã nguồn
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          profile: minimal
+          override: true
+      
+      # Tùy chọn: Chạy test để đảm bảo chất lượng code trước khi publish
+      - name: Run tests
+        run: cargo test
+        
+      # Bước quan trọng: Dùng OIDC để lấy Cargo API Token ngắn hạn
+      # Token sẽ được tự động đặt vào biến môi trường để cargo publish sử dụng.
+      - name: Authenticate with crates.io (Trusted Publishing)
+        # Sử dụng action chính thức để đổi OIDC token (từ bước permissions) lấy Cargo token
+        uses: rust-lang/crates-io-auth-action@v1
+        
+      # Cache dữ liệu để tăng tốc cho các lần sau 
+      - name: Cache dependencies and build artifacts
+        uses: actions/cache@v4.3.0
+        with:
+          # Thư mục build của Rust
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          # Key cache phụ thuộc vào Cargo.lock, Rust Toolchain và Hệ điều hành
+          key: ${{ runner.os }}-cargo-v3-${{ hashFiles('**/Cargo.lock') }}-${{ steps.toolchain.outputs.toolchain }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-v3-${{ hashFiles('**/Cargo.lock') }}
+            ${{ runner.os }}-cargo-v3-
+
+      # Publish Crate
+      # Lệnh 'cargo publish' sẽ tự động tìm và sử dụng token ngắn hạn.
+      # KHÔNG cần khai báo token thủ công.
+      - name: Publish to Crates.io
+        run: cargo publish
