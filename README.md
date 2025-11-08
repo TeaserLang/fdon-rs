@@ -69,4 +69,4 @@ match parse_fdon_zero_copy_arena(&minified_data, &arena) {
 
 ## License
 
-This project is licensed under the **AGPL-3.0-or-later**.
+This project is licensed under the **Apache 2.0 License**.

@@ -1,12 +1,12 @@
 [package]
 name = "fdon-rs"
-version = "0.2.0"
-edition = "2021"
+version = "0.2.1"
+edition = "2024"
 
 # --- REQUIRED FIELDS FOR PUBLISHING ---
 
 description = "A high-performance, zero-copy, and minified data format (FDON) parser for Rust, leveraging SIMD for read speed."
-license = "AGPL-3.0-or-later" 
+license = "Apache-2.0" 
 authors = ["Teaserverse <contact@teaserverse.online>"] 
 readme = "README.md"
 repository = "https://github.com/TeaserLang/fdon-rs" 
