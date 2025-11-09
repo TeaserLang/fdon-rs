@@ -8,6 +8,10 @@
 
 - **Zero-Copy Parsing (Arena-based):** Borrows string and key slices directly from the input buffer (`&str`), eliminating heap allocations during parsing. Internal Array and Object structures are allocated within a **Bumpalo memory arena** for optimal bulk deallocation.
 
+- Optimized Type System (Fast/Slow Paths): Supports specialized type prefixes for improved performance:
+    * Fast Path (`S`, `D`, `T` as number): Raw string, Date (as string), and Timestamp (as number) that require no internal escaping logic, maximizing speed.
+    * Slow Path (`SE`, `T` as string): Escaped String (`SE`) for complex content (like JSON or raw text with quotes/newlines) and Timestamp (as ISO string `T"..."`) which requires minimal allocation via the Arena for unescaped output.
+
 - **High Performance ("All-In" Optimization):**
     * Utilizes the `memchr` library for SIMD-accelerated delimiter searching.
     * Implements **Hashbrown** for HashMaps and **AHash** for the Hasher.
@@ -22,7 +26,7 @@
 Add this to your `Cargo.toml`:
 ```toml
 [dependencies]
-fdon-rs = "0.2.0" # Use the latest version
+fdon-rs = "0.3.0" # Use the latest version
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 ```
@@ -36,12 +40,21 @@ serde_json = "1.0"
 Use `parse_fdon_zero_copy_arena`. You are required to create and pass a **Bumpalo arena** to the parsing function.
 
 ```rust
-use fdon_rs::{minify_fdon, parse_fdon_zero_copy_arena};
+use fdon_rs::{minify_fdon, parse_fdon_zero_copy_arena, FdonValue};
 use bumpalo::Bump;
 use serde_json;
 
 // 1. Read input data (from file or network)
-let raw_data = "O { key : S\"value\", array: A [ N123, Btrue ] }";
+// Example with all new (SE, D, T) and old (S, N, B) prefixes
+let raw_data = r#"O{
+    id: N12345,
+    user: S"Teaser",
+    bio: SE"User's profile with \"quotes\" and a new line\n",
+    date: D"2025-11-09",
+    timestamp: T1762744800,
+    iso_time: T"2025-11-09T17:00:00Z",
+    active: Btrue
+}"#;
 
 // 2. Minify (removes whitespace)
 let minified_data = minify_fdon(&raw_data);
@@ -56,9 +69,14 @@ match parse_fdon_zero_copy_arena(&minified_data, &arena) {
         // 'value' is FdonValue<'_, '_>
         println!("Parse successful!");
         
+        // Check value type:
+        if let FdonValue::EscapedString(s) = &value {
+             println!("Unescaped Bio: {}", s);
+        }
+        
         // Convert to JSON
         let json = serde_json::to_string(&value).unwrap();
-        println!("{}", json);
+        println!("JSON Output: {}", json);
     }
     Err((msg, pos)) => {
         eprintln!("Error at position {}: {}", pos, msg);
